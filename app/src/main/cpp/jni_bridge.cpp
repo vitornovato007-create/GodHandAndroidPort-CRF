@@ -14,8 +14,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <limits>
-#include <cerrno>
 #include <dlfcn.h>
 #include "ps2_host_backend.h"
 #include "godhand/game_disc.h"
@@ -51,22 +49,6 @@ namespace ps2_pad {
 }
 
 namespace godhand {
-
-// Read ISO9660 little-endian integers without unaligned pointer dereferences.
-static uint32_t readLe32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
-}
-static bool readFully(int fd, void* buffer, size_t size) {
-    auto* out = static_cast<uint8_t*>(buffer); size_t done = 0;
-    while (done < size) { ssize_t n = read(fd, out + done, size - done); if (n < 0 && errno == EINTR) continue; if (n <= 0) return false; done += static_cast<size_t>(n); }
-    return true;
-}
-static bool writeFully(int fd, const void* buffer, size_t size) {
-    const auto* in = static_cast<const uint8_t*>(buffer); size_t done = 0;
-    while (done < size) { ssize_t n = write(fd, in + done, size - done); if (n < 0 && errno == EINTR) continue; if (n <= 0) return false; done += static_cast<size_t>(n); }
-    return true;
-}
 
 // Declarations of engine boot / notify functions implemented in main.cpp
 void bootAndroidRuntime(ANativeWindow* win, int width, int height, int rendererIdx, int resScaleIdx, int aspectIdx, int fpsIdx, int frameskipIdx);
@@ -169,15 +151,20 @@ bool extractIsoFdToCache(int fd, const std::string& cache_dir, std::function<voi
     fs::path outDir(cache_dir);
     std::error_code ec;
     fs::create_directories(outDir, ec);
-    if (ec) { LOGE("Cannot create cache directory: %s", ec.message().c_str()); return false; }
-    struct stat isoStat{};
-    if (fstat(fd, &isoStat) != 0 || isoStat.st_size < 17 * 2048LL) { LOGE("ISO descriptor invalid or file too small"); return false; }
-    const uint64_t isoSize = static_cast<uint64_t>(isoStat.st_size);
+
+    // Read Sector 16: Primary Volume Descriptor (PVD)
     constexpr size_t kSectorSize = 2048;
-    constexpr off_t pvdOffset = 16 * static_cast<off_t>(kSectorSize);
-    if (lseek(fd, pvdOffset, SEEK_SET) == (off_t)-1) { LOGE("Failed to seek to PVD sector: errno=%d", errno); return false; }
-    uint8_t pvd[kSectorSize]{};
-    if (!readFully(fd, pvd, sizeof(pvd))) { LOGE("Failed to read complete PVD sector: errno=%d", errno); return false; }
+    off_t pvdOffset = 16 * kSectorSize;
+    if (lseek(fd, pvdOffset, SEEK_SET) == (off_t)-1) {
+        LOGE("Failed to seek to PVD sector");
+        return false;
+    }
+
+    uint8_t pvd[kSectorSize];
+    if (read(fd, pvd, kSectorSize) != kSectorSize) {
+        LOGE("Failed to read PVD sector");
+        return false;
+    }
 
     if (pvd[0] != 0x01 || std::memcmp(pvd + 1, "CD001", 5) != 0) {
         LOGE("Invalid ISO9660 PVD header");
@@ -188,10 +175,8 @@ bool extractIsoFdToCache(int fd, const std::string& cache_dir, std::function<voi
 
     // Root directory record is at pvd + 156 (34 bytes)
     const uint8_t* rootRecord = pvd + 156;
-    if (rootRecord[0] < 34 || rootRecord[32] > rootRecord[0] - 33) { LOGE("Invalid ISO9660 root directory record"); return false; }
-    uint32_t rootLba = readLe32(rootRecord + 2);
-    uint32_t rootLen = readLe32(rootRecord + 10);
-    if (rootLen == 0 || static_cast<uint64_t>(rootLba) * kSectorSize + rootLen > isoSize) { LOGE("Root directory lies outside the ISO"); return false; }
+    uint32_t rootLba = *reinterpret_cast<const uint32_t*>(rootRecord + 2);
+    uint32_t rootLen = *reinterpret_cast<const uint32_t*>(rootRecord + 10);
 
     struct FileEntry {
         std::string relPath;
@@ -213,14 +198,14 @@ bool extractIsoFdToCache(int fd, const std::string& cache_dir, std::function<voi
         DirTask task = dirQueue.back();
         dirQueue.pop_back();
 
-        if (task.depth > 8 || task.len > (16u << 20) || task.len == 0 || static_cast<uint64_t>(task.lba) * kSectorSize + task.len > isoSize) { LOGW("Skipping invalid directory LBA=%u size=%u depth=%d", task.lba, task.len, task.depth); continue; }
+        if (task.depth > 8 || task.len > (64u << 20) || task.len == 0) continue;
 
         std::vector<uint8_t> dirBuf(task.len);
         if (lseek(fd, static_cast<off_t>(task.lba) * kSectorSize, SEEK_SET) == (off_t)-1) {
             LOGW("Failed to seek to directory at LBA %u", task.lba);
             continue;
         }
-        if (!readFully(fd, dirBuf.data(), task.len)) {
+        if (read(fd, dirBuf.data(), task.len) != static_cast<ssize_t>(task.len)) {
             LOGW("Failed to read directory at LBA %u", task.lba);
             continue;
         }
@@ -233,35 +218,35 @@ bool extractIsoFdToCache(int fd, const std::string& cache_dir, std::function<voi
                 offset = ((offset / kSectorSize) + 1) * kSectorSize;
                 continue;
             }
-            if (offset + recLen > task.len || recLen < 34) { LOGW("Malformed ISO9660 record at offset %zu", offset); break; }
-            const size_t recordOffset = offset;
-            uint8_t entryNameLen = dirBuf[recordOffset + 32];
-            if (static_cast<size_t>(entryNameLen) > static_cast<size_t>(recLen) - 33) { LOGW("Invalid ISO filename length at offset %zu", recordOffset); offset += recLen; continue; }
-            uint32_t entryLba = readLe32(&dirBuf[recordOffset + 2]);
-            uint32_t entryDataLen = readLe32(&dirBuf[recordOffset + 10]);
-            uint8_t entryFlags = dirBuf[recordOffset + 25];
+            if (offset + recLen > task.len || recLen < 34) break;
+
+            uint32_t entryLba = *reinterpret_cast<const uint32_t*>(&dirBuf[offset + 2]);
+            uint32_t entryDataLen = *reinterpret_cast<const uint32_t*>(&dirBuf[offset + 10]);
+            uint8_t entryFlags = dirBuf[offset + 25];
+            uint8_t entryNameLen = dirBuf[offset + 32];
 
             offset += recLen;
 
-            if (entryNameLen == 1 && (dirBuf[recordOffset + 33] == 0 || dirBuf[recordOffset + 33] == 1)) {
+            if (entryNameLen == 1 && (dirBuf[offset - recLen + 33] == 0 || dirBuf[offset - recLen + 33] == 1)) {
                 continue; // Current or parent directory (".", "..")
             }
 
-            std::string name(reinterpret_cast<const char*>(&dirBuf[recordOffset + 33]), entryNameLen);
+            std::string name(reinterpret_cast<const char*>(&dirBuf[offset - recLen + 33]), entryNameLen);
             size_t semi = name.find(';');
             if (semi != std::string::npos) name = name.substr(0, semi);
             if (name.empty()) continue;
 
             std::string fullRel = task.prefix.empty() ? name : (task.prefix + "/" + name);
             bool isDir = (entryFlags & 0x02) != 0;
-            if (name == "." || name == ".." || name.find('/') != std::string::npos || name.find('\\') != std::string::npos) continue;
-            if (static_cast<uint64_t>(entryLba) * kSectorSize + entryDataLen > isoSize) { LOGW("Skipping out-of-range ISO entry: %s", fullRel.c_str()); continue; }
-            if (isDir) { if (entryDataLen <= (16u << 20)) dirQueue.push_back({ entryLba, entryDataLen, fullRel, task.depth + 1 }); }
-            else { filesToExtract.push_back({ fullRel, entryLba, entryDataLen }); }
+
+            if (isDir) {
+                dirQueue.push_back({ entryLba, entryDataLen, fullRel, task.depth + 1 });
+            } else {
+                filesToExtract.push_back({ fullRel, entryLba, entryDataLen });
+            }
         }
     }
 
-    if (filesToExtract.empty()) { LOGE("ISO contains no extractable files"); return false; }
     progress(30, "Extracting God Hand game files from ISO...");
     for (size_t i = 0; i < filesToExtract.size(); ++i) {
         const auto& e = filesToExtract[i];
@@ -271,23 +256,24 @@ bool extractIsoFdToCache(int fd, const std::string& cache_dir, std::function<voi
         int pct = 30 + static_cast<int>((i + 1) * 45 / filesToExtract.size());
         progress(pct, "Extracting " + e.relPath);
 
-        if (e.size == 0 || static_cast<uint64_t>(e.lba) * kSectorSize + e.size > isoSize) { LOGW("Skipping invalid/empty ISO file: %s", e.relPath.c_str()); continue; }
-        int outFd = open(dest.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        int outFd = open(dest.string().c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (outFd < 0) {
             LOGW("Could not open destination: %s", dest.string().c_str());
             continue;
         }
 
-        bool fileOk = lseek(fd, static_cast<off_t>(e.lba) * kSectorSize, SEEK_SET) != (off_t)-1;
-        uint32_t remaining = e.size;
-        std::vector<uint8_t> chunk(256 * 1024);
-        while (fileOk && remaining > 0) {
-            size_t toRead = std::min<size_t>(remaining, chunk.size());
-            if (!readFully(fd, chunk.data(), toRead) || !writeFully(outFd, chunk.data(), toRead)) { fileOk = false; break; }
-            remaining -= static_cast<uint32_t>(toRead);
+        if (lseek(fd, static_cast<off_t>(e.lba) * kSectorSize, SEEK_SET) != (off_t)-1) {
+            uint32_t remaining = e.size;
+            std::vector<uint8_t> chunk(1024 * 1024);
+            while (remaining > 0) {
+                size_t toRead = std::min<size_t>(remaining, chunk.size());
+                ssize_t n = read(fd, chunk.data(), toRead);
+                if (n <= 0) break;
+                write(outFd, chunk.data(), n);
+                remaining -= n;
+            }
         }
         close(outFd);
-        if (!fileOk) { LOGE("Read/write failed extracting %s (errno=%d)", e.relPath.c_str(), errno); return false; }
     }
 
     // Unpack MODULES/IRX.IMS if present
@@ -346,26 +332,63 @@ JNIEXPORT jboolean JNICALL
 Java_com_owaissseeee_godhand_NativeBridge_extractAndCacheIsoFromFd(
     JNIEnv* env, jobject /*thiz*/, jint fd, jstring outCacheDir, jobject progressListener)
 {
+    if (fd < 0 || outCacheDir == nullptr || progressListener == nullptr) {
+        if (fd >= 0) close(fd);
+        LOGE("extractAndCacheIsoFromFd called with invalid arguments");
+        return JNI_FALSE;
+    }
+
     const char* cache_cstr = env->GetStringUTFChars(outCacheDir, nullptr);
+    if (cache_cstr == nullptr) {
+        close(fd);
+        return JNI_FALSE; // JVM has a pending exception.
+    }
     std::string cache_dir(cache_cstr);
     env->ReleaseStringUTFChars(outCacheDir, cache_cstr);
 
     jclass listenerCls = env->GetObjectClass(progressListener);
+    if (listenerCls == nullptr) { close(fd); return JNI_FALSE; }
     jmethodID onProgMid = env->GetMethodID(listenerCls, "onNativeProgress", "(ILjava/lang/String;Ljava/lang/String;)V");
+    if (onProgMid == nullptr) {
+        env->DeleteLocalRef(listenerCls);
+        close(fd);
+        LOGE("ProgressListener.onNativeProgress method not found");
+        return JNI_FALSE;
+    }
 
     auto report = [&](int pct, const std::string& msg) {
+        if (env->ExceptionCheck()) return;
         jstring jStage = env->NewStringUTF("Disc Cache Pipeline");
         jstring jLog = env->NewStringUTF(msg.c_str());
-        env->CallVoidMethod(progressListener, onProgMid, pct, jStage, jLog);
-        env->DeleteLocalRef(jStage);
-        env->DeleteLocalRef(jLog);
+        if (jStage != nullptr && jLog != nullptr) {
+            env->CallVoidMethod(progressListener, onProgMid, pct, jStage, jLog);
+        }
+        if (jStage != nullptr) env->DeleteLocalRef(jStage);
+        if (jLog != nullptr) env->DeleteLocalRef(jLog);
     };
 
-    report(15, "[ISO] Extracting SLUS_215.03, SYSTEM.CNF, GODHAND.FST, MODULES, _DATA.AFS...");
-    bool ok = godhand::extractIsoFdToCache(fd, cache_dir, [&](int p, const std::string& msg) {
-        report(p, msg);
-    });
+    bool ok = false;
+    try {
+        report(15, "[ISO] Extracting God Hand files from ISO9660...");
+        ok = godhand::extractIsoFdToCache(fd, cache_dir, [&](int p, const std::string& msg) {
+            report(p, msg);
+        });
+    } catch (const std::bad_alloc&) {
+        LOGE("ISO extraction aborted: out of memory");
+        report(0, "[ERROR] Out of memory while extracting ISO");
+        ok = false;
+    } catch (const std::exception& e) {
+        LOGE("ISO extraction exception: %s", e.what());
+        report(0, std::string("[ERROR] Native ISO exception: ") + e.what());
+        ok = false;
+    } catch (...) {
+        LOGE("ISO extraction aborted by unknown native exception");
+        report(0, "[ERROR] Unknown native ISO extraction failure");
+        ok = false;
+    }
+
     close(fd);
+    env->DeleteLocalRef(listenerCls);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
