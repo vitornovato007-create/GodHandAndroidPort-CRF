@@ -332,26 +332,63 @@ JNIEXPORT jboolean JNICALL
 Java_com_owaissseeee_godhand_NativeBridge_extractAndCacheIsoFromFd(
     JNIEnv* env, jobject /*thiz*/, jint fd, jstring outCacheDir, jobject progressListener)
 {
+    if (fd < 0 || outCacheDir == nullptr || progressListener == nullptr) {
+        if (fd >= 0) close(fd);
+        LOGE("extractAndCacheIsoFromFd called with invalid arguments");
+        return JNI_FALSE;
+    }
+
     const char* cache_cstr = env->GetStringUTFChars(outCacheDir, nullptr);
+    if (cache_cstr == nullptr) {
+        close(fd);
+        return JNI_FALSE; // JVM has a pending exception.
+    }
     std::string cache_dir(cache_cstr);
     env->ReleaseStringUTFChars(outCacheDir, cache_cstr);
 
     jclass listenerCls = env->GetObjectClass(progressListener);
+    if (listenerCls == nullptr) { close(fd); return JNI_FALSE; }
     jmethodID onProgMid = env->GetMethodID(listenerCls, "onNativeProgress", "(ILjava/lang/String;Ljava/lang/String;)V");
+    if (onProgMid == nullptr) {
+        env->DeleteLocalRef(listenerCls);
+        close(fd);
+        LOGE("ProgressListener.onNativeProgress method not found");
+        return JNI_FALSE;
+    }
 
     auto report = [&](int pct, const std::string& msg) {
+        if (env->ExceptionCheck()) return;
         jstring jStage = env->NewStringUTF("Disc Cache Pipeline");
         jstring jLog = env->NewStringUTF(msg.c_str());
-        env->CallVoidMethod(progressListener, onProgMid, pct, jStage, jLog);
-        env->DeleteLocalRef(jStage);
-        env->DeleteLocalRef(jLog);
+        if (jStage != nullptr && jLog != nullptr) {
+            env->CallVoidMethod(progressListener, onProgMid, pct, jStage, jLog);
+        }
+        if (jStage != nullptr) env->DeleteLocalRef(jStage);
+        if (jLog != nullptr) env->DeleteLocalRef(jLog);
     };
 
-    report(15, "[ISO] Extracting SLUS_215.03, SYSTEM.CNF, GODHAND.FST, MODULES, _DATA.AFS...");
-    bool ok = godhand::extractIsoFdToCache(fd, cache_dir, [&](int p, const std::string& msg) {
-        report(p, msg);
-    });
+    bool ok = false;
+    try {
+        report(15, "[ISO] Extracting God Hand files from ISO9660...");
+        ok = godhand::extractIsoFdToCache(fd, cache_dir, [&](int p, const std::string& msg) {
+            report(p, msg);
+        });
+    } catch (const std::bad_alloc&) {
+        LOGE("ISO extraction aborted: out of memory");
+        report(0, "[ERROR] Out of memory while extracting ISO");
+        ok = false;
+    } catch (const std::exception& e) {
+        LOGE("ISO extraction exception: %s", e.what());
+        report(0, std::string("[ERROR] Native ISO exception: ") + e.what());
+        ok = false;
+    } catch (...) {
+        LOGE("ISO extraction aborted by unknown native exception");
+        report(0, "[ERROR] Unknown native ISO extraction failure");
+        ok = false;
+    }
+
     close(fd);
+    env->DeleteLocalRef(listenerCls);
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
