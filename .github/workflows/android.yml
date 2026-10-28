@@ -31,8 +31,31 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+        # This repository has gitlinks but no .gitmodules file; dependencies are pinned below.
+
+      - name: Restore pinned native dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          restore_gitlink() {
+            local repo_url="$1"
+            local target="$2"
+            local commit="$3"
+            local temp="$(mktemp -d)"
+
+            git clone --filter=blob:none "$repo_url" "$temp/repo"
+            git -C "$temp/repo" checkout --detach "$commit"
+            rm -rf "$target"
+            mkdir -p "$(dirname "$target")"
+            mv "$temp/repo" "$target"
+            rm -rf "$temp"
+          }
+
+          restore_gitlink "https://github.com/google/oboe.git" \
+            "app/src/main/cpp/thirdparty/oboe" "4468344c8fdfdd7df068d5abefe2d8615fd6b431"
+          restore_gitlink "https://github.com/simde/simde.git" \
+            "app/src/main/cpp/thirdparty/simde" "2e5224981e9123b8fe89a9833a978556d636a565"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -55,6 +78,8 @@ jobs:
           test -f gradle/wrapper/gradle-wrapper.properties
           test -f app/src/main/cpp/CMakeLists.txt
           test -f app/src/main/cpp/jni_bridge.cpp
+          test -f app/src/main/cpp/thirdparty/oboe/CMakeLists.txt
+          test -d app/src/main/cpp/thirdparty/simde/simde
           chmod +x gradlew
           ./gradlew --version
 
@@ -71,7 +96,9 @@ jobs:
 
       - name: Build release APK (ARM64)
         run: |
-          ./gradlew --no-daemon --parallel --max-workers=2             --stacktrace             :app:assembleRelease
+          ./gradlew --no-daemon --parallel --max-workers=2 \
+            --stacktrace \
+            :app:assembleRelease
 
       - name: Verify APK and native libraries
         shell: bash
